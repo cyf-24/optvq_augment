@@ -1,0 +1,14 @@
+pretrains/
+__pycache__/
+.cache/
+.vscode/
+outputs/
+*.bin
+*.pb
+*.pth
+*.tar.gz
+titok_b_64/
+*.npz
+assets/
+analysis/
+wandb/
