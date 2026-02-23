@@ -36,7 +36,7 @@ model:
         intermediate_size: 3072
         dropout: 0.1
         attn_drop: 0.1
-        num_steps: 8
+        num_steps: 16
         class_label_dropout: 0.1
         image_seq_len: ${model.vq_model.num_latent_tokens}
         condition_num_classes: 1000
@@ -77,7 +77,6 @@ lr_scheduler:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 10_000
         end_lr: 1e-5
-
 
 training:
     gradient_accumulation_steps: 2

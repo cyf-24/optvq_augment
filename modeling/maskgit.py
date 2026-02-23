@@ -160,7 +160,7 @@ class LocalARHead(nn.Module):
         
         # 2. 位置编码 (用于区分 AR 步骤 0~3)
         self.pos_emb = nn.Parameter(torch.randn(1, augment_ratio, hidden_size) * 0.02)
-        
+        self.cond_pos_emb = nn.Parameter(torch.randn(1, augment_ratio, hidden_size) * 0.02)
         # 3. 条件投影: 将 Backbone 特征 z 映射到 AdaLN 所需维度
         # 对应 tokenbridge.py 中的 self.condition_proj
         self.condition_proj = nn.Linear(hidden_size, hidden_size)
@@ -230,6 +230,7 @@ class LocalARHead(nn.Module):
         z_flat = z.reshape(B * L, H) 
         cond = self.condition_proj(z_flat) 
         cond = cond.unsqueeze(1) # [B*L, 1, H]
+        cond = cond + self.cond_pos_emb
         
         # 2. 准备 Input
         if targets is not None:
@@ -264,55 +265,71 @@ class LocalARHead(nn.Module):
         return logits.view(B, L, A, -1).permute(0, 1, 3, 2)
 
     @torch.no_grad()
-    def sample(self, z, temperature=1.0):
+    def sample(self, cond_z, uncond_z=None, cfg_scale=1.0, temperature=1.0):
         """
-        推理采样 (Autoregressive Loop)
+        带有 Logits 层面 CFG 的推理采样
         """
-        B, L, H = z.shape
+        B, L, H = cond_z.shape
         A = self.augment_ratio
         
-        z_flat = z.reshape(B * L, H)
-        cond = self.condition_proj(z_flat)
+        # 1. 准备条件 (Condition)
+        cond_flat = cond_z.reshape(B * L, H)
+        c_cond = self.condition_proj(cond_flat).unsqueeze(1) + self.cond_pos_emb
         
-        # 🚨🚨🚨 【关键修复】 🚨🚨🚨
-        # 这里也要加 unsqueeze(1)
-        cond = cond.unsqueeze(1) # [B*L, 1, H]
-        
-        # 初始输入: [SOS]
+        do_cfg = False
+        if uncond_z is not None and cfg_scale != 0.0 and cfg_scale != 1.0:
+            do_cfg = True
+            uncond_flat = uncond_z.reshape(B * L, H)
+            c_uncond = self.condition_proj(uncond_flat).unsqueeze(1) + self.cond_pos_emb
+            
         curr_input = self.sos_token.expand(B * L, 1, H)
-        
         generated_ids = []
         all_log_probs = []
-        
-        # 缓存每一步的输入特征
         input_embs_list = [curr_input] 
 
         for i in range(A):
-            # 1. 拼接当前所有输入
-            x = torch.cat(input_embs_list, dim=1)
-            
-            # 2. 加位置编码
+            x = torch.cat(input_embs_list, dim=1) # [B*L, i+1, H]
             x = x + self.pos_emb[:, :i+1, :]
+            mask = torch.empty(i+1, i+1, device=cond_z.device).fill_(float("-inf")).triu_(1)
             
-            # 3. Mask
-            mask = torch.empty(i+1, i+1, device=z.device).fill_(float("-inf")).triu_(1)
+            # 2. CFG 并行计算
+            if do_cfg:
+                # 在 Batch 维度拼接，并行计算 Cond 和 Uncond，节省时间
+                x_double = torch.cat([x, x], dim=0) # [2*B*L, i+1, H]
+                c_double = torch.cat([c_cond[:, :i+1, :], c_uncond[:, :i+1, :]], dim=0)
+                
+                out = x_double
+                for block in self.blocks:
+                    out = block(out, c=c_double, attn_mask=mask)
+                out = self.final_layer(out, c=c_double)
+                
+                logits_double = self.heads[i](out[:, -1, :]) # [2*B*L, V]
+                cond_logits, uncond_logits = logits_double.chunk(2, dim=0)
+                
+                # 🔥🔥🔥 【核心修正】在 Logits 层面执行 CFG 🔥🔥🔥
+                logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)
+            else:
+                # 无 CFG 或 scale=1 时的正常逻辑
+                out = x
+                current_cond = c_cond[:, :i+1, :]
+                for block in self.blocks:
+                    out = block(out, c=current_cond, attn_mask=mask)
+                out = self.final_layer(out, c=current_cond)
+                logits = self.heads[i](out[:, -1, :]) 
             
-            # 4. Forward Blocks
-            for block in self.blocks:
-                x = block(x, c=cond, attn_mask=mask)
+            # 3. 采样逻辑 (自带温度保护)
+            base_probs = F.softmax(logits, dim=-1)
             
-            x = self.final_layer(x, c=cond)
-            
-            # 5. 预测第 i 步
-            logits = self.heads[i](x[:, -1, :]) 
-            
-            # 6. 采样
-            probs = F.softmax(logits / temperature, dim=-1)
-            next_token = torch.argmax(probs, dim=-1) 
+            if temperature < 1e-6:
+                next_token = torch.argmax(logits, dim=-1)
+            else:
+                scaled_probs = F.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(scaled_probs, num_samples=1).squeeze(-1)
             
             generated_ids.append(next_token)
             
-            selected_probs = torch.gather(probs, 1, next_token.unsqueeze(1)).squeeze(1)
+            # 记录 Confidence (基于基础概率)
+            selected_probs = torch.gather(base_probs, 1, next_token.unsqueeze(1)).squeeze(1)
             all_log_probs.append(torch.log(selected_probs + 1e-10))
             
             if i < A - 1:
@@ -510,29 +527,40 @@ class ImageBert(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2406.07550", "imag
             # 判断 mask
             is_mask = (ids == self.mask_token_id).any(dim=-1)
 
-            # --- 核心生成逻辑开始 ---
+# --- 核心生成逻辑开始 ---
             
-            # 1. 提取 Backbone 特征 z
-            if cfg_scale != 0:
-                cond_z = self.get_backbone_features(ids, condition, cond_drop_prob=0.0)
+            # 1. 独立提取并 Normalize 特征
+            cond_z = self.get_backbone_features(ids, condition, cond_drop_prob=0.0)
+            cond_z = self.feature_norm(cond_z) # 必须保持与训练分布一致
+            
+            if cfg_scale != 0 and cfg_scale != 1.0:
                 uncond_z = self.get_backbone_features(ids, condition, cond_drop_prob=1.0)
-                # 在 Feature 层面做 CFG
-                z = uncond_z + (cond_z - uncond_z) * cfg_scale
+                uncond_z = self.feature_norm(uncond_z) 
             else:
-                z = self.get_backbone_features(ids, condition, cond_drop_prob=0.0)
+                uncond_z = None
 
             # 2. 调用 Head 生成
             if self.augment_ratio > 1:
-                # 调用 Local AR 采样，直接返回 IDs 和 Confidence
-                sampled_ids, confidence_score = self.lm_head.sample(z, temperature=annealed_temp)
+                # 把 CFG 的任务交给 AR Head 内部去处理
+                sampled_ids, confidence_score = self.lm_head.sample(
+                    cond_z=cond_z, 
+                    uncond_z=uncond_z, 
+                    cfg_scale=cfg_scale, 
+                    temperature=annealed_temp
+                )
                 
                 # Confidence 处理
                 confidence = torch.where(is_mask, confidence_score, torch.full_like(confidence_score, float('inf')))
 
             else:
-                # 兼容旧逻辑
+                # 兼容不带 AR 的旧逻辑
+                if uncond_z is not None:
+                    z = uncond_z + (cond_z - uncond_z) * cfg_scale
+                else:
+                    z = cond_z
                 logits = self.lm_head(z).unsqueeze(-1)
                 
+                # 🔥 补上漏掉的原版采样和 Confidence 计算逻辑 🔥
                 if softmax_temperature_annealing:
                     logits = logits / (0.5 + 0.8 * (1 - ratio))
 
@@ -545,8 +573,7 @@ class ImageBert(BaseModel, PyTorchModelHubMixin, tags=["arxiv:2406.07550", "imag
                 probs = F.softmax(logits, dim=-2)
                 sampled_probs = torch.gather(probs, dim=-2, index=sampled_ids.unsqueeze(-2)).squeeze(-2)
                 confidence = sampled_probs.squeeze(-1)
-                confidence = torch.where(is_mask, confidence, torch.full_like(confidence, float('inf')))
-
+                confidence = torch.where(is_mask, confidence, torch.full_like(confidence, float('inf')))  
             # --- 核心生成逻辑结束 ---
             
             # Apply Mask Replacement
